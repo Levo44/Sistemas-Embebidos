@@ -1,0 +1,352 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <DHT.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ================= OLED =================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ================= PINES ESP32 =================
+#define PIN_DHT      4
+#define PIN_CS_SD    5
+#define PIN_BTN      15
+
+#define PIN_LED_R    25
+#define PIN_LED_G    26
+#define PIN_LED_B    27
+
+#define PIN_BUZZER   14
+
+// SPI para SD
+#define SD_SCK       18
+#define SD_MISO      19
+#define SD_MOSI      23
+
+// I2C para OLED
+#define I2C_SDA      21
+#define I2C_SCL      22
+
+// ================= DHT =================
+#define DHTTYPE DHT22
+DHT dht(PIN_DHT, DHTTYPE);
+
+// ================= ESTADOS =================
+enum Estado { MONITOR, ALERTA, LOG };
+Estado estado_actual = MONITOR;
+
+// ================= VARIABLES =================
+float temp_c = 0.0;
+float humedad = 0.0;
+
+unsigned long t_ultimo_guardado = 0;
+unsigned long t_btn_presionado = 0;
+unsigned long t_parpadeo = 0;
+
+int total_registros = 0;
+bool led_rojo_estado = false;
+bool sd_disponible = false;
+
+const unsigned long INTERVALO_GUARDADO = 10000;   // 10 s
+const unsigned long TIEMPO_BOTON_LOG = 3000;      // 3 s
+const unsigned long INTERVALO_PARPADEO = 300;     // ms
+
+// ================= BUZZER PWM =================
+const int buzzerChannel = 0;
+const int buzzerFreqBase = 2000;
+const int buzzerResolution = 8;
+
+// ================= FUNCIONES AUXILIARES =================
+void setLED(bool r, bool g, bool b) {
+  digitalWrite(PIN_LED_R, r ? HIGH : LOW);
+  digitalWrite(PIN_LED_G, g ? HIGH : LOW);
+  digitalWrite(PIN_LED_B, b ? HIGH : LOW);
+}
+
+void apagarLeds() {
+  setLED(false, false, false);
+}
+
+void sonarBuzzer(int frecuencia) {
+  ledcWriteTone(buzzerChannel, frecuencia);
+}
+
+void apagarBuzzer() {
+  ledcWriteTone(buzzerChannel, 0);
+}
+
+void contarRegistrosSD() {
+  total_registros = 0;
+
+  if (!sd_disponible || !SD.exists("/datos.csv")) {
+    return;
+  }
+
+  File f = SD.open("/datos.csv", FILE_READ);
+  if (!f) {
+    Serial.println("No se pudo abrir /datos.csv para leer.");
+    return;
+  }
+
+  while (f.available()) {
+    String linea = f.readStringUntil('\n');
+    linea.trim();
+
+    if (linea.length() > 0 && !linea.startsWith("tiempo_s")) {
+      total_registros++;
+    }
+  }
+
+  f.close();
+}
+
+void guardarEnSD() {
+  if (!sd_disponible) {
+    Serial.println("SD no disponible. No se guardo registro.");
+    return;
+  }
+
+  File f = SD.open("/datos.csv", FILE_APPEND);
+  if (!f) {
+    Serial.println("Error al abrir /datos.csv para escribir.");
+    return;
+  }
+
+  f.print(millis() / 1000);
+  f.print(",");
+  f.print(temp_c, 1);
+  f.print(",");
+  f.println(humedad, 1);
+  f.close();
+
+  total_registros++;
+  Serial.print("Guardado #");
+  Serial.println(total_registros);
+}
+
+void mostrarOLEDMonitor() {
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+
+  oled.setTextSize(1);
+  oled.setCursor(0, 0);
+  oled.print("MONITOR");
+
+  oled.setTextSize(2);
+  oled.setCursor(0, 16);
+  oled.print(temp_c, 1);
+  oled.print(" C");
+
+  oled.setTextSize(1);
+  oled.setCursor(0, 42);
+  oled.print("Hum: ");
+  oled.print(humedad, 1);
+  oled.print("%");
+
+  oled.setCursor(0, 54);
+  oled.print("Reg: ");
+  oled.print(total_registros);
+
+  oled.display();
+}
+
+void mostrarOLEDAlerta() {
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+
+  oled.setTextSize(1);
+  oled.setCursor(18, 0);
+  oled.print("!!! ALERTA !!!");
+
+  oled.setTextSize(2);
+  oled.setCursor(0, 16);
+  oled.print(temp_c, 1);
+  oled.print(" C");
+
+  oled.setTextSize(1);
+  oled.setCursor(0, 42);
+
+  if (temp_c > 35.0 && humedad > 85.0) {
+    oled.print("TEMP Y HUM ALTAS");
+  } else if (temp_c > 35.0) {
+    oled.print("TEMPERATURA ALTA");
+  } else if (humedad > 85.0) {
+    oled.print("HUMEDAD ALTA");
+  }
+
+  oled.setCursor(0, 54);
+  oled.print("Hum: ");
+  oled.print(humedad, 1);
+  oled.print("%");
+
+  oled.display();
+}
+
+void mostrarOLEDLog() {
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+
+  oled.setTextSize(1);
+  oled.setCursor(12, 10);
+  oled.print("MODO REGISTRO");
+
+  oled.setCursor(10, 28);
+  oled.print("Total:");
+
+  oled.setTextSize(2);
+  oled.setCursor(10, 40);
+  oled.print(total_registros);
+
+  oled.setTextSize(1);
+  oled.setCursor(0, 58);
+  oled.print("Suelta el boton");
+
+  oled.display();
+}
+
+void inicializarOLED() {
+  Wire.begin(I2C_SDA, I2C_SCL);  // ESP32 permite definir SDA y SCL aquí. :contentReference[oaicite:1]{index=1}
+
+  if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("No se encontro la OLED.");
+    while (true) {
+      delay(100);
+    }
+  }
+
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+  oled.setCursor(0, 0);
+  oled.println("Iniciando sistema...");
+  oled.display();
+}
+
+void inicializarSD() {
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, PIN_CS_SD);
+
+  sd_disponible = SD.begin(PIN_CS_SD, SPI);
+
+  if (!sd_disponible) {
+    Serial.println("No se pudo inicializar la SD.");
+    return;
+  }
+
+  Serial.println("SD lista.");
+
+  if (!SD.exists("/datos.csv")) {
+    File f = SD.open("/datos.csv", FILE_WRITE);
+    if (f) {
+      f.println("tiempo_s,temp_c,humedad_pct");
+      f.close();
+    } else {
+      Serial.println("No se pudo crear /datos.csv");
+    }
+  }
+
+  contarRegistrosSD();
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_BTN, INPUT_PULLUP);
+  pinMode(PIN_LED_R, OUTPUT);
+  pinMode(PIN_LED_G, OUTPUT);
+  pinMode(PIN_LED_B, OUTPUT);
+
+  apagarLeds();
+
+  // API LEDC compatible con Arduino-ESP32 2.x. En 3.x cambió. :contentReference[oaicite:2]{index=2}
+  ledcSetup(buzzerChannel, buzzerFreqBase, buzzerResolution);
+  ledcAttachPin(PIN_BUZZER, buzzerChannel);
+
+  dht.begin();
+  inicializarOLED();
+  inicializarSD();
+
+  Serial.println("Sistema iniciado. Estado: MONITOR");
+}
+
+// ================= LOOP =================
+void loop() {
+  // Leer DHT22
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  if (!isnan(h) && !isnan(t)) {
+    humedad = h;
+    temp_c = t;
+  } else {
+    Serial.println("Error al leer DHT22");
+  }
+
+  // Leer boton
+  bool btn = (digitalRead(PIN_BTN) == LOW);
+
+  // Mantener 3 s -> LOG
+  if (btn) {
+    if (t_btn_presionado == 0) {
+      t_btn_presionado = millis();
+    }
+
+    if (millis() - t_btn_presionado >= TIEMPO_BOTON_LOG) {
+      estado_actual = LOG;
+    }
+  } else {
+    t_btn_presionado = 0;
+
+    if (estado_actual == LOG) {
+      estado_actual = MONITOR;
+    }
+  }
+
+  // ALERTA solo si no está en LOG
+  if (estado_actual != LOG) {
+    if (temp_c > 35.0 || humedad > 85.0) {
+      estado_actual = ALERTA;
+    } else if (estado_actual == ALERTA) {
+      estado_actual = MONITOR;
+    }
+  }
+
+  // Acciones por estado
+  switch (estado_actual) {
+    case MONITOR:
+      apagarBuzzer();
+      setLED(false, true, false);
+
+      mostrarOLEDMonitor();
+
+      if (millis() - t_ultimo_guardado >= INTERVALO_GUARDADO) {
+        guardarEnSD();
+        t_ultimo_guardado = millis();
+      }
+      break;
+
+    case ALERTA:
+      if (millis() - t_parpadeo >= INTERVALO_PARPADEO) {
+        t_parpadeo = millis();
+        led_rojo_estado = !led_rojo_estado;
+        setLED(led_rojo_estado, false, false);
+      }
+
+      sonarBuzzer(1500);
+      mostrarOLEDAlerta();
+      break;
+
+    case LOG:
+      apagarBuzzer();
+      setLED(false, false, true);
+      mostrarOLEDLog();
+      break;
+  }
+
+  delay(200);
+}
